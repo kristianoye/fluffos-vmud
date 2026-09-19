@@ -7,6 +7,7 @@
 #include "base/internal/tracing.h"
 #include "packages/core/file.h"
 
+#include <algorithm>
 #include <iostream>
 #include <cerrno>
 #if HAVE_DIRENT_H
@@ -77,98 +78,94 @@ namespace fs = ghc::filesystem;
 #define OS_mkdir(x, y) mkdir(x, y)
 #endif
 
-static int match_string(char* /*match*/, char* /*str*/);
 static int do_move(const char* from, const char* to, int flag);
-static int pstrcmp(const void* /*p1*/, const void* /*p2*/);
-static int parrcmp(const void* /*p1*/, const void* /*p2*/);
-static void encode_stat(svalue_t* /*vp*/, int /*flags*/, char* /*str*/, struct stat* /*st*/);
+static void encode_stat(svalue_t* /*vp*/, int /*flags*/, const DirScanEntry& /*entry*/);
 
 enum { MAX_LINES = 50 };
 
-/*
- * These are used by qsort in get_dir().
- */
-static int pstrcmp(const void* p1, const void* p2) {
-  auto* x = (svalue_t*)p1;
-  auto* y = (svalue_t*)p2;
-
-  return strcmp(x->u.string, y->u.string);
-}
-
-static int parrcmp(const void* p1, const void* p2) {
-  auto* x = (svalue_t*)p1;
-  auto* y = (svalue_t*)p2;
-
-  return strcmp(x->u.arr->item[0].u.string, y->u.arr->item[0].u.string);
-}
-
-static void encode_stat(svalue_t* vp, int flags, char* str, struct stat* st) {
+static void encode_stat(svalue_t* vp, int flags, const DirScanEntry& entry) {
   if (flags == -1) {
     array_t* v = allocate_empty_array(3);
 
     v->item[0].type = T_STRING;
     v->item[0].subtype = STRING_MALLOC;
-    v->item[0].u.string = string_copy(str, "encode_stat");
+    v->item[0].u.string = string_copy(entry.name.c_str(), "encode_stat");
     v->item[1].type = T_NUMBER;
-    v->item[1].u.number = ((st->st_mode & S_IFDIR) ? -2 : st->st_size);
+    v->item[1].u.number = entry.is_dir ? -2 : entry.size;
     v->item[2].type = T_NUMBER;
-    v->item[2].u.number = st->st_mtime;
+    v->item[2].u.number = entry.mtime;
     vp->type = T_ARRAY;
     vp->u.arr = v;
   } else {
     vp->type = T_STRING;
     vp->subtype = STRING_MALLOC;
-    vp->u.string = string_copy(str, "encode_stat");
+    vp->u.string = string_copy(entry.name.c_str(), "encode_stat");
   }
 }
 
-/*
- * List files in directory. This function do same as standard list_files did,
- * but instead writing files right away to user this returns an array
- * containing those files. Actually most of code is copied from list_files()
- * function.
- * Differences with list_files:
- *
- *   - file_list("/w"); returns ({ "w" })
- *
- *   - file_list("/w/"); and file_list("/w/."); return contents of directory
- *     "/w"
- *
- *   - file_list("/");, file_list("."); and file_list("/."); return contents
- *     of directory "/"
- *
- * With second argument equal to non-zero, instead of returning an array
- * of strings, the function will return an array of arrays about files.
- * The information in each array is supplied in the order:
- *    name of file,
- *    size of file,
- *    last update of file.
- */
 /* WIN32 should be fixed to do this correctly (i.e. no ifdefs for it) */
 enum { MAX_FNAME_SIZE = 255, MAX_PATH_LEN = 1024 };
-array_t* get_dir(const char* path, int flags) {
-  auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
-  array_t* v;
-  int i, count = 0;
-  DIR* dirp;
-  int namelen, do_match = 0;
+// Case-insensitive-agnostic shell-style wildcard match ('*'/'?'/'\\'
+// escape); shared by get_dir() and async_getdir()'s worker thread. Pure
+// pointer-walking, no LPC calls -- safe on any thread.
+int match_string(const char* match, const char* str) {
+  int i;
 
-  struct dirent* de;
+again:
+  if (*str == '\0' && *match == '\0') {
+    return 1;
+  }
+  switch (*match) {
+    case '?':
+      if (*str == '\0') {
+        return 0;
+      }
+      str++;
+      match++;
+      goto again;
+    case '*':
+      match++;
+      if (*match == '\0') {
+        return 1;
+      }
+      for (i = 0; str[i] != '\0'; i++) {
+        if (match_string(match, str + i)) {
+          return 1;
+        }
+      }
+      return 0;
+    case '\0':
+      return 0;
+    case '\\':
+      match++;
+      if (*match == '\0') {
+        return 0;
+      }
+    /* Fall through ! */
+    default:
+      if (*match == *str) {
+        match++;
+        str++;
+        goto again;
+      }
+      return 0;
+  }
+}
+
+// get_dir()'s wildcard/single-file resolution, extracted so
+// async_getdir()'s worker thread can share it -- pure stat()/string
+// logic, no LPC allocation, no master apply. `path` must already have
+// been through check_valid_path().
+bool resolve_dir_query(const char* path, DirQuery* out) {
   struct stat st;
-  char* endtemp;
   char temppath[MAX_FNAME_SIZE + MAX_PATH_LEN + 2];
   char regexppath[MAX_FNAME_SIZE + MAX_PATH_LEN + 2];
   char* p;
+  int do_match = 0;
 
   if (!path) {
-    return nullptr;
-  }
-
-  path = check_valid_path(path, current_object, "stat", 0);
-
-  if (path == nullptr) {
-    return nullptr;
+    return false;
   }
 
   if (strlen(path) < 2) {
@@ -192,7 +189,7 @@ array_t* get_dir(const char* path, int flags) {
 
   if (stat(temppath, &st) < 0) {
     if (*p == '\0') {
-      return nullptr;
+      return false;
     }
     if (p != temppath) {
       strcpy(regexppath, p + 1);
@@ -206,78 +203,127 @@ array_t* get_dir(const char* path, int flags) {
     if (*p == '/' && *(p + 1) != '\0') {
       p++;
     }
-    v = allocate_empty_array(1);
-    encode_stat(&v->item[0], flags, p, &st);
-    return v;
-  }
-  if ((dirp = opendir(temppath)) == nullptr) {
-    return nullptr;
-  }
-  /*
-   * Count files
-   */
-  for (de = readdir(dirp); de; de = readdir(dirp)) {
-    namelen = strlen(de->d_name);
-    if (!do_match && (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)) {
-      continue;
-    }
-    if (do_match && !match_string(regexppath, de->d_name)) {
-      continue;
-    }
-    count++;
-    if (count >= max_array_size) {
-      break;
-    }
+    out->is_single_entry = true;
+    out->single_entry.name = p;
+    out->single_entry.is_dir = S_ISDIR(st.st_mode);
+    out->single_entry.size = st.st_size;
+    out->single_entry.mtime = st.st_mtime;
+    return true;
   }
 
-  /*
-   * Make array and put files on it.
-   */
-  v = allocate_empty_array(count);
-  if (count == 0) {
-    /* This is the easy case :-) */
-    closedir(dirp);
-    return v;
+  out->is_single_entry = false;
+  out->scan_dir = temppath;
+  out->has_pattern = do_match != 0;
+  if (do_match) {
+    out->pattern = regexppath;
   }
-  rewinddir(dirp);
-  endtemp = temppath + strlen(temppath);
+  return true;
+}
 
-  // Append '/' only if it fits (leaving room for the terminator); the
-  // directory path can be up to MAX_FNAME_SIZE+MAX_PATH_LEN long.
-  if ((size_t)(endtemp - temppath) + 2 <= sizeof(temppath)) {
-    *endtemp++ = '/';
-    *endtemp = '\0';
+bool scan_dir_query(const DirQuery& query, bool want_stat, int max_entries,
+                    std::vector<DirScanEntry>* out) {
+  if (query.is_single_entry) {
+    out->push_back(query.single_entry);
+    return true;
   }
 
-  for (i = 0, de = readdir(dirp); i < count; de = readdir(dirp)) {
-    namelen = strlen(de->d_name);
-    if (!do_match && (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)) {
+  DIR* dirp = opendir(query.scan_dir.c_str());
+  if (dirp == nullptr) {
+    return false;
+  }
+
+  char pathbuf[MAX_FNAME_SIZE + MAX_PATH_LEN + 2];
+  size_t const dirlen = query.scan_dir.size();
+  bool const dir_fits = dirlen + 2 <= sizeof(pathbuf);
+  if (dir_fits) {
+    memcpy(pathbuf, query.scan_dir.c_str(), dirlen);
+    pathbuf[dirlen] = '/';
+    pathbuf[dirlen + 1] = '\0';
+  }
+
+  for (struct dirent* de = readdir(dirp);
+       de != nullptr && static_cast<int>(out->size()) < max_entries; de = readdir(dirp)) {
+    if (!query.has_pattern && (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)) {
       continue;
     }
-    if (do_match && !match_string(regexppath, de->d_name)) {
+    if (query.has_pattern && !match_string(query.pattern.c_str(), de->d_name)) {
       continue;
     }
-    de->d_name[namelen] = '\0';
-    if (flags == -1) {
-      /*
-       * We'll have to .... sigh.... stat() the file to get some add'tl
-       * info.
-       */
-      size_t const avail = sizeof(temppath) - (size_t)(endtemp - temppath);
-      if (namelen < avail) {
-        memcpy(endtemp, de->d_name, namelen + 1);
-        stat(temppath, &st); /* We assume it works. */
-      } else {
-        // Combined path too long to form; can't stat it, report zeroed info.
-        memset(&st, 0, sizeof(st));
+
+    DirScanEntry entry;
+    entry.name = de->d_name;
+    if (want_stat) {
+      size_t const namelen = strlen(de->d_name);
+      if (dir_fits && dirlen + 1 + namelen < sizeof(pathbuf)) {
+        memcpy(pathbuf + dirlen + 1, de->d_name, namelen + 1);
+        struct stat st;
+        if (stat(pathbuf, &st) == 0) {
+          entry.is_dir = S_ISDIR(st.st_mode);
+          entry.size = st.st_size;
+          entry.mtime = st.st_mtime;
+        }
       }
+      // else: combined path too long to form; can't stat it, leave zeroed
+      // (matches get_dir()'s own "can't form the path" fallback).
     }
-    encode_stat(&v->item[i], flags, de->d_name, &st);
-    i++;
+    out->push_back(std::move(entry));
   }
   closedir(dirp);
-  /* Sort the names. */
-  qsort((void*)v->item, count, sizeof v->item[0], (flags == -1) ? parrcmp : pstrcmp);
+
+  std::sort(out->begin(), out->end(),
+            [](const DirScanEntry& a, const DirScanEntry& b) { return a.name < b.name; });
+  return true;
+}
+
+/*
+ * List files in directory. This function do same as standard list_files did,
+ * but instead writing files right away to user this returns an array
+ * containing those files.
+ * Differences with list_files:
+ *
+ *   - file_list("/w"); returns ({ "w" })
+ *
+ *   - file_list("/w/"); and file_list("/w/."); return contents of directory
+ *     "/w"
+ *
+ *   - file_list("/");, file_list("."); and file_list("/."); return contents
+ *     of directory "/"
+ *
+ * With second argument equal to non-zero, instead of returning an array
+ * of strings, the function will return an array of arrays about files.
+ * The information in each array is supplied in the order:
+ *    name of file,
+ *    size of file,
+ *    last update of file.
+ */
+array_t* get_dir(const char* path, int flags) {
+  auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
+
+  if (!path) {
+    return nullptr;
+  }
+
+  path = check_valid_path(path, current_object, "stat", 0);
+  if (path == nullptr) {
+    return nullptr;
+  }
+
+  DirQuery query;
+  if (!resolve_dir_query(path, &query)) {
+    return nullptr;
+  }
+
+  std::vector<DirScanEntry> entries;
+  if (!scan_dir_query(query, flags == -1, max_array_size, &entries)) {
+    return nullptr;
+  }
+
+  array_t* v = allocate_empty_array(entries.size());
+  for (size_t i = 0; i < entries.size(); i++) {
+    encode_stat(&v->item[i], flags, entries[i]);
+  }
+  // scan_dir_query() already returned `entries` sorted by name, and this
+  // loop preserves that order 1:1 -- no separate qsort needed here.
   return v;
 }
 

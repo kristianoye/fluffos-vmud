@@ -9,12 +9,12 @@ title: async / async_getdir
 
 ### SYNOPSIS
 
-    void async_getdir( string dir, function callback );
+    void async_getdir( string dir, function callback, int stat );
     promise async_getdir( string dir );
 
 ### DESCRIPTION
 
-    If  'dir' is a filename ('*' and '?' wildcards are supported), an array
+    If  'dir' is a filename ('*' and '?' wildcards are supported), n array
     of strings is returned to the callback containing all filenames that match
     the specification. If 'dir' is a directory name (ending with a slash--ie:
     "/u/", "/adm/", etc), all filenames in that directory are returned.
@@ -30,9 +30,13 @@ title: async / async_getdir
             // array of matching filenames
         }
 
-
     With the callback OMITTED, returns a promise fulfilled with the sorted
     array of names -- `string *names = await async_getdir(dir);`.
+
+    With the third, optional parameter, set to non-zero, async_getdir will
+    return the stat() info for each directory entry like get_dir():
+
+          (\{ filename, size_of_file, last_time_file_touched \})
 
 ### NOTE
 

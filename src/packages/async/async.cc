@@ -69,6 +69,14 @@ struct Request {
      registering stack frame is gone. fun->args/fun->narg are repointed at
      this array's storage; null when there are no bound args. */
   array_t* bound_args = nullptr;
+  int get_stat;
+  // AGETDIR only: entries gathered by scan_dir_query() (pure stat()/
+  // readdir() data, no LPC allocation) -- handle_getdir() encodes these
+  // into svalue_t/array_t on the main thread. max_entries is read from
+  // CONFIG_INT() on the main thread before dispatch, since config access
+  // from the worker thread would race a runtime `config` change.
+  std::vector<DirScanEntry> dir_entries;
+  int max_entries = 0;
 };
 
 /* Capture the current user context on a new request (issue #1104). */
@@ -288,30 +296,15 @@ int aio_db_exec(struct Request* req) {
 void* getdirthread(struct Request* req) {
   ScopedTracer const work_tracer("getdir", EventCategory::DEFAULT, [=] { return json{req->path}; });
 
-  DIR* dirp = nullptr;
-  if ((dirp = opendir(req->path.c_str())) == nullptr) {
-    req->ret = 0;
+  DirQuery query;
+  if (!resolve_dir_query(req->path.c_str(), &query) ||
+      !scan_dir_query(query, req->get_stat != 0, req->max_entries, &req->dir_entries)) {
+    req->ret = -1;
     req->status = DONE;
     return nullptr;
   }
-  /*
-   * Count files
-   */
-  int i = 0;
-  for (auto* de = readdir(dirp); de; de = readdir(dirp)) {
-    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-    // The buffer is used as an array of `struct dirent`, indexed by i, so it
-    // must grow by sizeof(dirent) per entry -- growing by sizeof(dirent*) (a
-    // pointer, ~8 bytes) undersized it and memcpy of the ~280-byte dirent
-    // overflowed the heap once a directory held enough entries.
-    req->data.resize(static_cast<size_t>(i + 1) * sizeof(struct dirent));
-    memcpy(&((dirent*)(req->data.data()))[i], de, sizeof(*de));
-    i++;
-  }
 
-  closedir(dirp);
-
-  req->ret = i;
+  req->ret = static_cast<int>(req->dir_entries.size());
   req->status = DONE;
   return nullptr;
 }
@@ -359,17 +352,17 @@ int add_read(const char* fname, function_to_call_t* fun, promise_t* prom) {
 }
 
 #ifdef F_ASYNC_GETDIR
-int add_getdir(const char* fname, function_to_call_t* fun, promise_t* prom) {
+int add_getdir(const char* fname, int get_stat, function_to_call_t* fun, promise_t* prom) {
   auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
 
   if (fname) {
-    // printf("fname: %s\n", fname);
     auto* req = new Request();
-    req->data.resize(max_array_size);
     req->fun = fun;
     req->prom = prom;
     req->type = AGETDIR;
     capture_command_giver(req);
+    req->get_stat = get_stat;
+    req->max_entries = max_array_size;
     req->path = fname;
     return aio_getdir(req);
   }
@@ -441,29 +434,32 @@ void handle_read(struct Request* req) {
 
 #ifdef F_ASYNC_GETDIR
 void handle_getdir(struct Request* req) {
-  auto max_array_size = CONFIG_INT(__MAX_ARRAY_SIZE__);
-
-  int ret_size = req->ret;
-  if (ret_size > max_array_size) {
-    ret_size = max_array_size;
+  if (req->ret < 0) {
+    push_number(0);
+    deliver_result(req, /*rejected=*/1);
+    return;
   }
-  array_t* ret = allocate_empty_array(ret_size);
-  if (ret_size > 0) {
-    for (int i = 0; i < ret_size; i++) {
-      auto de = ((struct dirent*)req->data.data())[i];
-      svalue_t* vp = &(ret->item[i]);
+
+  array_t* ret = allocate_empty_array(req->dir_entries.size());
+  for (size_t i = 0; i < req->dir_entries.size(); i++) {
+    const auto& entry = req->dir_entries[i];
+    svalue_t* vp = &ret->item[i];
+    if (req->get_stat) {
+      array_t* item = allocate_empty_array(3);
+      item->item[0].type = T_STRING;
+      item->item[0].subtype = STRING_MALLOC;
+      item->item[0].u.string = string_copy(entry.name.c_str(), "handle_getdir");
+      item->item[1].type = T_NUMBER;
+      item->item[1].u.number = entry.is_dir ? -2 : entry.size;
+      item->item[2].type = T_NUMBER;
+      item->item[2].u.number = entry.mtime;
+      vp->type = T_ARRAY;
+      vp->u.arr = item;
+    } else {
       vp->type = T_STRING;
       vp->subtype = STRING_MALLOC;
-      vp->u.string = string_copy(de.d_name, "encode_stat");
+      vp->u.string = string_copy(entry.name.c_str(), "handle_getdir");
     }
-
-    qsort((void*)ret->item, ret_size, sizeof ret->item[0],
-          [](const void* p1, const void* p2) -> int {
-            auto* x = (svalue_t*)p1;
-            auto* y = (svalue_t*)p2;
-
-            return strcmp(x->u.string, y->u.string);
-          });
   }
 
   push_refed_array(ret);
@@ -653,13 +649,21 @@ void f_async_write() {
 void f_async_getdir() {
   function_to_call_t* fun = nullptr;
   promise_t* prom = nullptr;
+  int get_stat = 0;
 
   /* before any ownership is taken, with st_num_arg latched across the
-   * master apply -- see f_async_read(); the path is the FIRST argument */
+   * master apply -- see f_async_read(); the path is the FIRST argument.
+   * Argument shapes: (path), (path,cb), (path,cb,get_stat) -- get_stat,
+   * when present, is always LAST/topmost; the callback (when present) is
+   * always argument index 1, so process_efun_callback(1, ...) finds it
+   * regardless of whether get_stat follows it. */
   int const num_arg = st_num_arg;
-  const char* path =
-      check_valid_path((sp - (num_arg - 1))->u.string, current_object, "get_dir", 0);
+  const char* path = check_valid_path((sp - (num_arg - 1))->u.string, current_object, "get_dir", 0);
   st_num_arg = num_arg;
+
+  if (num_arg >= 3) {
+    get_stat = sp->u.number;
+  }
 
   if (num_arg >= 2) {
     std::unique_ptr<function_to_call_t> cb(new function_to_call_t);
@@ -668,14 +672,16 @@ void f_async_getdir() {
       error("async_getdir: callback must be a function pointer, not a string.\n");
     }
     cb->f.fp->hdr.ref++;
-    pop_stack();
     fun = cb.release();
   } else {
     prom = promise_alloc();
   }
 
-  add_getdir(path, fun, prom);
-  pop_stack();
+  // Both get_stat and the callback have already been read from their
+  // fixed stack positions above; drop all of this call's arguments now.
+  pop_n_elems(num_arg);
+
+  add_getdir(path, get_stat, fun, prom);
   if (prom) {
     prom->ref++;
     push_refed_promise(prom);
