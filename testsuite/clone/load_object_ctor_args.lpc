@@ -1,0 +1,12 @@
+// Fixture for the efuns/load_object_args regression: records whatever
+// create() was called with, and how many times.
+mixed *ctor_args;
+int create_count;
+
+void create(mixed args...) {
+  ctor_args = args;
+  create_count++;
+}
+
+mixed *query_ctor_args() { return ctor_args; }
+int query_create_count() { return create_count; }

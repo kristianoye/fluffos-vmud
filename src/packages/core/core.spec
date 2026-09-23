@@ -125,7 +125,11 @@ void message(mixed, mixed, string | string * | object | object *,
 /* the find_* functions */
 
 object find_object(string, int default: 0);
-object load_object find_object(string, int default: 1);
+/* Optional args after the file name are forwarded to create() the same way
+ * new()'s/clone_object()'s trailing args are -- but only when this call is
+ * what actually loads the object; a find of an already-loaded object never
+ * calls create() again, so the args are silently dropped in that case. */
+object load_object(string, ...);
 
 /* mapping functions */
 

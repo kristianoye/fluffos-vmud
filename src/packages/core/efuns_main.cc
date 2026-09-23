@@ -346,8 +346,8 @@ void f_call_stack() {
         ret->item[i].subtype = STRING_MALLOC;
         /* get_line_number() needs a real program; a driver-context frame
          * has none (see the case-0 comment) */
-        ret->item[i].u.string =
-            prog ? string_copy(get_line_number(progc, prog), "call_stack") : string_copy("", "call_stack");
+        ret->item[i].u.string = prog ? string_copy(get_line_number(progc, prog), "call_stack")
+                                     : string_copy("", "call_stack");
       }
       break;
   }
@@ -634,6 +634,24 @@ void f_find_object() {
   if (ob && object_visible(ob)) {
     /* find_object only returns undested objects */
     put_unrefed_undested_object(ob, "find_object");
+  } else {
+    *sp = const0;
+  }
+}
+#endif
+
+#ifdef F_LOAD_OBJECT
+void f_load_object() {
+  svalue_t* arg = sp - st_num_arg + 1;
+  object_t* ob;
+
+  /* Trailing varargs are constructor args, forwarded to create() only if
+   * this call is the one that actually loads the object (see core.spec). */
+  ob = find_object(arg->u.string, st_num_arg - 1);
+
+  free_string_svalue(sp);
+  if (ob && object_visible(ob)) {
+    put_unrefed_undested_object(ob, "load_object");
   } else {
     *sp = const0;
   }
