@@ -38,7 +38,11 @@ int filename_to_obname(const char*, char*, int);
 // redirect_depth counts master::compile_object() virtual-object redirects
 // already followed for this load chain; callers outside simulate.cc should
 // never pass it (default 0 starts a fresh chain).
-object_t* load_object(const char*, int, int redirect_depth = 0);
+// num_arg is the count of extra constructor-argument svalues already on the
+// VM stack (just above the requested object name, LPC varargs style) to be
+// forwarded to call_create() -- see the load_object() efun. Callers that
+// don't pass constructor args (the default) leave prior behavior unchanged.
+object_t* load_object(const char*, int, int redirect_depth = 0, int num_arg = 0);
 /* `arena`, when given, is used for the compile's transient allocations and
  * is left untouched -- the CALLER owns it, so compiler output (diagnostics)
  * stays readable after this returns. lpcshell relies on that; the driver
@@ -50,7 +54,9 @@ object_t* clone_object(const char*, int);
 object_t* environment(svalue_t*);
 object_t* first_inventory(svalue_t*);
 object_t* object_present(svalue_t*, object_t*);
-object_t* find_object(const char*);
+// num_arg: see load_object()'s comment above -- forwarded when this actually
+// has to load (rather than find an already-loaded object).
+object_t* find_object(const char*, int num_arg = 0);
 object_t* find_object2(const char*);
 void move_object(object_t*, object_t*);
 void destruct_object(object_t*);

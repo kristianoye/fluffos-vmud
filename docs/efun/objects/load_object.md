@@ -9,12 +9,20 @@ title: objects / load_object
 
 ### SYNOPSIS
 
-    object load_object( string str );
+    object load_object( string str, mixed args... );
 
 ### DESCRIPTION
 
     Find  the  object with the file name 'str'.  If the file exists and the
     object hasn't been loaded yet, it is loaded and returned (if possible).
+
+    Any trailing 'args' are passed on to create() -- the same convention
+    new()/clone_object() use -- but only when this call is the one that
+    actually loads the object. If the object was already loaded, create()
+    is not called again and any 'args' passed are silently ignored. Virtual
+    objects (loaded via master::compile_object()) initialize via
+    virtual_start() rather than create(), so 'args' are also ignored for
+    them.
 
 ### RETURN VALUES
 
@@ -23,5 +31,6 @@ title: objects / load_object
 
 ### SEE ALSO
 
-    file_name(3), find_object(3), stat(3)
+    file_name(3), find_object(3), clone_object(3), new(3), stat(3)
+
 

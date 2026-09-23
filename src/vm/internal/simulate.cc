@@ -497,7 +497,7 @@ int filename_to_obname(const char* src, char* dest, int size) {
  * it.
  *
  */
-object_t* load_object(const char* lname, int callcreate, int redirect_depth) {
+object_t* load_object(const char* lname, int callcreate, int redirect_depth, int num_arg) {
   ScopedTracer _tracer("LPC Load Object", EventCategory::VM_LOAD_OBJECT,
                        [=] { return json{lname}; });
 
@@ -572,6 +572,12 @@ object_t* load_object(const char* lname, int callcreate, int redirect_depth) {
     ob = load_virtual_object(actualname, 0, redirect_depth);
     restore_command_giver();
     num_objects_this_thread--;
+    // Virtual objects initialize via APPLY_VIRTUAL_START (0 args), not
+    // call_create(): any constructor args passed to load_object() have no
+    // destination here, so just drop them to keep the VM stack balanced.
+    if (num_arg) {
+      pop_n_elems(num_arg);
+    }
     return ob;
   }
   /*
@@ -677,14 +683,22 @@ object_t* load_object(const char* lname, int callcreate, int redirect_depth) {
      */
     if (!(ob = ObjectTable::instance().find(name))) {
       // Reload ourselves with the caller's raw spelling so an explicit
-      // extension stays exact across the inherit-retry loop.
-      ob = load_object(lname, 1);
+      // extension stays exact across the inherit-retry loop. Forward
+      // num_arg: this recursive call is the same originally-requested
+      // load and will consume it, one way or another, on its own.
+      ob = load_object(lname, 1, 0, num_arg);
       /* sigh, loading the inherited file removed us */
       if (!ob) {
         num_objects_this_thread--;
         return nullptr;
       }
       ob->load_time = get_current_time();
+    } else if (num_arg) {
+      // The inherited parent's own create() already loaded (and
+      // constructed) an object under our name -- nobody will call
+      // call_create() for it now, so the pending constructor args must be
+      // dropped here instead of leaking onto the VM stack.
+      pop_n_elems(num_arg);
     }
     num_objects_this_thread--;
     return ob;
@@ -712,7 +726,9 @@ object_t* load_object(const char* lname, int callcreate, int redirect_depth) {
   }
 
   if (init_object(ob) && callcreate) {
-    call_create(ob, 0);
+    call_create(ob, num_arg);
+  } else if (num_arg) {
+    pop_n_elems(num_arg);
   }
   if (!(ob->flags & O_DESTRUCTED) && function_exists(APPLY_CLEAN_UP, ob, 1)) {
     ob->flags |= O_WILL_CLEAN_UP;
@@ -2042,21 +2058,30 @@ void do_write(svalue_t* arg) {
  * returned.
  */
 
-object_t* find_object(const char* str) {
+object_t* find_object(const char* str, int num_arg) {
   object_t* ob;
   char tmpbuf[MAX_OBJECT_NAME_SIZE];
 
   if (!filename_to_obname(str, tmpbuf, sizeof tmpbuf)) {
+    if (num_arg) {
+      pop_n_elems(num_arg);
+    }
     return nullptr;
   }
 
   if ((ob = ObjectTable::instance().find(tmpbuf))) {
+    // Already loaded: no fresh call_create() will run, so any constructor
+    // args the caller (load_object()) passed along are dropped here.
+    if (num_arg) {
+      pop_n_elems(num_arg);
+    }
     return ob;
   }
   // Load with the caller's raw spelling: an explicit ".c"/".lpc" must
   // stay exact through load_object's source resolution (it re-strips
-  // internally for the object name).
-  ob = load_object(str, 1);
+  // internally for the object name). load_object() consumes num_arg
+  // itself, one way or another, regardless of which path it takes.
+  ob = load_object(str, 1, 0, num_arg);
   if (!ob || (ob->flags & O_DESTRUCTED)) { /* *sigh* */
     return nullptr;
   }
