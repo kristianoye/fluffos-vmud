@@ -1,0 +1,18 @@
+// db_stmt_exec()/db_stmt_close()/db_stmt_free_result()/db_stmt_next_result()
+// on a prepared-statement handle that was never issued must be a clean,
+// catchable error, never a crash. The statement handle table is its own
+// process-global namespace (separate from db connection handles), so use a
+// similarly unreachable sentinel -- see db_close.lpc for why a small handle
+// is unsafe here (randomized test order).
+#define NEVER_ISSUED_STMT_HANDLE 1000000
+
+void do_tests() {
+#ifdef __PACKAGE_DB__
+  ASSERT(catch(db_stmt_exec(NEVER_ISSUED_STMT_HANDLE)));
+  ASSERT(catch(db_stmt_exec(NEVER_ISSUED_STMT_HANDLE, "arg")));
+  ASSERT(catch(db_stmt_close(NEVER_ISSUED_STMT_HANDLE)));
+  ASSERT(catch(db_stmt_free_result(NEVER_ISSUED_STMT_HANDLE)));
+  ASSERT(catch(db_stmt_next_result(NEVER_ISSUED_STMT_HANDLE)));
+#endif
+  ASSERT(1);
+}
