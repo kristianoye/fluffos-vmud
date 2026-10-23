@@ -492,11 +492,20 @@ void handle_db_exec(struct Request* req) {
 void check_reqs() {
   ScopedTracer const tracer("Async callback");
 
-  std::lock_guard<std::mutex> const lock(finished_reqs_lock);
-  while (!finished_reqs.empty()) {
-    auto* req = finished_reqs.front();
-    finished_reqs.pop_front();
+  while (true) {
+    Request* req;
+    {
+      std::lock_guard<std::mutex> const lock(finished_reqs_lock);
+      if (finished_reqs.empty()) {
+        break;
+      }
+      req = finished_reqs.front();
+      finished_reqs.pop_front();
+    }
 
+    // Delivery can run LPC that queues work (taking reqs_lock). Workers
+    // publish while holding reqs_lock then finished_reqs_lock, so neither
+    // queue lock may be held across the callback.
     enum atypes const type = (req->type);
     req->type = ADONE;
     /* Restore the user context captured at registration (issue #1104). */
@@ -671,6 +680,10 @@ void f_async_getdir() {
     if (cb->ob != nullptr) {
       error("async_getdir: callback must be a function pointer, not a string.\n");
     }
+    // The trailing stat flag is an efun option, not a bound callback
+    // argument. Its stack slot will be freed before asynchronous delivery.
+    cb->narg = 0;
+    cb->args = nullptr;
     cb->f.fp->hdr.ref++;
     fun = cb.release();
   } else {
