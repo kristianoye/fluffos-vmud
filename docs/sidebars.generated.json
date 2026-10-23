@@ -719,6 +719,12 @@
           },
           {
             "type": "doc",
+            "id": "efun/db/db_free_result",
+            "key": "efun/db/db_free_result",
+            "label": "db_free_result"
+          },
+          {
+            "type": "doc",
             "id": "efun/db/db_rollback",
             "key": "efun/db/db_rollback",
             "label": "db_rollback"
@@ -728,6 +734,36 @@
             "id": "efun/db/db_status",
             "key": "efun/db/db_status",
             "label": "db_status"
+          },
+          {
+            "type": "doc",
+            "id": "efun/db/db_stmt_close",
+            "key": "efun/db/db_stmt_close",
+            "label": "db_stmt_close"
+          },
+          {
+            "type": "doc",
+            "id": "efun/db/db_stmt_exec",
+            "key": "efun/db/db_stmt_exec",
+            "label": "db_stmt_exec"
+          },
+          {
+            "type": "doc",
+            "id": "efun/db/db_stmt_free_result",
+            "key": "efun/db/db_stmt_free_result",
+            "label": "db_stmt_free_result"
+          },
+          {
+            "type": "doc",
+            "id": "efun/db/db_stmt_next_result",
+            "key": "efun/db/db_stmt_next_result",
+            "label": "db_stmt_next_result"
+          },
+          {
+            "type": "doc",
+            "id": "efun/db/db_stmt_prepare",
+            "key": "efun/db/db_stmt_prepare",
+            "label": "db_stmt_prepare"
           }
         ]
       },
@@ -1922,6 +1958,17 @@
             "label": "js_export"
           }
         ]
+      },
+      {
+        "type": "category",
+        "key": "efun/json_lpc",
+        "label": "json_lpc",
+        "link": {
+          "type": "generated-index",
+          "title": "json_lpc",
+          "slug": "/efun/json_lpc/"
+        },
+        "items": []
       },
       {
         "type": "category",
