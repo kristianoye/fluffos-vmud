@@ -1,8 +1,21 @@
 void got(mixed res) {}
+#ifdef __PACKAGE_ASYNC__
+nosave mixed expected_stat;
+
+void got_stat(mixed res, mixed args...) {
+  ASSERT_EQ(expected_stat, res);
+  ASSERT_EQ(({}), args);
+  RELEASE_LATCH("async_getdir stat callback");
+}
+#endif
+
 void do_tests() {
 #ifdef __PACKAGE_ASYNC__
   // Queues the request; the callback fires after this run.
   ASSERT_EQ(0, catch(async_getdir("/", (: got :))));
+  expected_stat = get_dir("/single/tests/efuns/async_getdir.lpc", -1);
+  EXPECT_LATCH("async_getdir stat callback");
+  ASSERT_EQ(0, async_getdir("/single/tests/efuns/async_getdir.lpc", (: got_stat :), -1));
 #endif
   ASSERT(1);
 }

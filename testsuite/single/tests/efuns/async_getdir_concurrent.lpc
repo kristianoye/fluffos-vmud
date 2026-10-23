@@ -1,0 +1,43 @@
+#ifdef __PACKAGE_ASYNC__
+#define REQUESTS 256
+
+nosave int completed;
+nosave mixed expected;
+
+async void await_directories() {
+  promise *pending = allocate(REQUESTS);
+  for (int i = 0; i < REQUESTS; i++) {
+    pending[i] = async_getdir("/single/tests/efuns/async_getdir_concurrent.lpc");
+  }
+  for (int i = 0; i < REQUESTS; i++) {
+    ASSERT_EQ(expected, await pending[i]);
+  }
+  RELEASE_LATCH("concurrent async_getdir promises");
+}
+
+void got_directory(mixed result) {
+  ASSERT_EQ(expected, result);
+  if (++completed == REQUESTS) {
+    RELEASE_LATCH("concurrent async_getdir callbacks");
+  }
+}
+
+void enqueue_directories(mixed result) {
+  ASSERT_EQ(expected, result);
+  // Enqueue from inside a delivery while workers publish other results.
+  for (int i = 0; i < REQUESTS; i++) {
+    async_getdir("/single/tests/efuns/async_getdir_concurrent.lpc", (: got_directory :));
+  }
+  await_directories();
+}
+
+void do_tests() {
+  expected = get_dir("/single/tests/efuns/async_getdir_concurrent.lpc");
+  completed = 0;
+  EXPECT_LATCH("concurrent async_getdir callbacks");
+  EXPECT_LATCH("concurrent async_getdir promises");
+  async_getdir("/single/tests/efuns/async_getdir_concurrent.lpc", (: enqueue_directories :));
+}
+#else
+void do_tests() { ASSERT(1); }
+#endif

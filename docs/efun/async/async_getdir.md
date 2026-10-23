@@ -14,7 +14,7 @@ title: async / async_getdir
 
 ### DESCRIPTION
 
-    If  'dir' is a filename ('*' and '?' wildcards are supported), n array
+    If 'dir' is a filename ('*' and '?' wildcards are supported), an array
     of strings is returned to the callback containing all filenames that match
     the specification. If 'dir' is a directory name (ending with a slash--ie:
     "/u/", "/adm/", etc), all filenames in that directory are returned.
@@ -31,14 +31,21 @@ title: async / async_getdir
         }
 
     With the callback OMITTED, returns a promise fulfilled with the sorted
-    array of names -- `string *names = await async_getdir(dir);`.
+    array of names -- `string *names = await async_getdir(dir);`. If the
+    directory cannot be opened, the promise is rejected with 0 instead.
 
     With the third, optional parameter, set to non-zero, async_getdir will
     return the stat() info for each directory entry like get_dir():
 
           (\{ filename, size_of_file, last_time_file_touched \})
 
+    The callback receives exactly one result argument; the stat flag is not
+    passed to it.
+
 ### NOTE
+
+    Multiple requests may complete out of order. A callback may enqueue
+    further asynchronous requests without waiting for other requests to finish.
 
     When the 'this_player in call_out' driver setting is enabled,
     this_player() inside the callback is preserved from the time the
@@ -47,4 +54,3 @@ title: async / async_getdir
 ### SEE ALSO
 
     file_size(3), get_dir(3), stat(3), time(3)
-
