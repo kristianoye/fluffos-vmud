@@ -74,6 +74,15 @@
 #include <pthread.h>
 #endif
 
+#ifdef USE_MYSQL
+#include <climits>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <vector>
+#endif
+
 static int db_conn_alloc, db_conn_used;
 static db_t* db_conn_list;
 
@@ -137,7 +146,103 @@ static char* MySQL_errormsg(dbconn_t*);
 
 static db_defn_t mysql = {"MySQL", MySQL_connect, MySQL_close,   MySQL_execute, MySQL_fetch,
                           nullptr, nullptr,       MySQL_cleanup, nullptr,       MySQL_errormsg};
+
+// Prepared-statement handle table, parallel to db_conn_list but keyed by its
+// own handle namespace (db_stmt_prepare()'s return value). Each entry's
+// MYSQL_STMT* lives only as long as both its own handle AND the owning
+// connection are open -- close_mysql_stmts_for_connection() must run before
+// a connection's MYSQL* is actually torn down (f_db_close(), db_cleanup()),
+// or a later db_stmt_exec()/db_stmt_close() on it is a use-after-free.
+struct mysql_stmt_entry_t {
+  int flags;      // DB_FLAG_EMPTY when the slot is free
+  int db_handle;  // owning db_conn_list handle (1-based)
+  MYSQL_STMT* stmt;
+};
+
+static int mysql_stmt_alloc, mysql_stmt_used;
+static mysql_stmt_entry_t* mysql_stmt_list;
+
+static mysql_stmt_entry_t* find_mysql_stmt(int handle) {
+  if (handle < 1 || handle > mysql_stmt_alloc ||
+      (mysql_stmt_list[handle - 1].flags & DB_FLAG_EMPTY)) {
+    return nullptr;
+  }
+  return &mysql_stmt_list[handle - 1];
+}
+
+static int create_mysql_stmt(int db_handle, MYSQL_STMT* stmt) {
+  int i;
+
+  if (mysql_stmt_alloc == mysql_stmt_used) {
+    i = mysql_stmt_alloc;
+    mysql_stmt_alloc += 10;
+    if (!mysql_stmt_list) {
+      mysql_stmt_list = (mysql_stmt_entry_t*)DCALLOC(mysql_stmt_alloc, sizeof(mysql_stmt_entry_t),
+                                                     TAG_DB, "create_mysql_stmt");
+    } else {
+      mysql_stmt_list = RESIZE(mysql_stmt_list, mysql_stmt_alloc, mysql_stmt_entry_t, TAG_DB,
+                               "create_mysql_stmt");
+    }
+    while (i < mysql_stmt_alloc) {
+      mysql_stmt_list[i++].flags = DB_FLAG_EMPTY;
+    }
+  }
+
+  for (i = 0; i < mysql_stmt_alloc; i++) {
+    if (mysql_stmt_list[i].flags & DB_FLAG_EMPTY) {
+      mysql_stmt_list[i].flags = 0;
+      mysql_stmt_list[i].db_handle = db_handle;
+      mysql_stmt_list[i].stmt = stmt;
+      mysql_stmt_used++;
+      return i + 1;
+    }
+  }
+
+  fatal("mysql_stmt_alloc != mysql_stmt_used, but no empty slots");
+}
+
+// Releases a prepared statement's resources and frees its handle slot.
+// Must be called while the owning connection is still open (mysql_stmt_close()
+// talks to the server) -- close_mysql_stmts_for_connection() below is always
+// run before a connection's MYSQL* is actually closed, for exactly this
+// reason.
+static int close_mysql_stmt(mysql_stmt_entry_t* se) {
+  int ret = 1;
+  if (se->stmt) {
+    if (mysql_stmt_close(se->stmt)) {
+      ret = 0;
+    }
+    se->stmt = nullptr;
+  }
+  se->flags = DB_FLAG_EMPTY;
+  mysql_stmt_used--;
+  return ret;
+}
+
+// Must run BEFORE the owning connection's MYSQL* is actually closed
+// (f_db_close(), db_cleanup()) -- see close_mysql_stmt()'s comment.
+static void close_mysql_stmts_for_connection(int db_handle) {
+  for (int i = 0; i < mysql_stmt_alloc; i++) {
+    if (!(mysql_stmt_list[i].flags & DB_FLAG_EMPTY) && mysql_stmt_list[i].db_handle == db_handle) {
+      close_mysql_stmt(&mysql_stmt_list[i]);
+    }
+  }
+}
+
+// Defined below, next to MySQL_fetch() (the "MySQL support" section): binds
+// result columns, fully materializes the current result set into
+// db->c.mysql.stmt_fields/stmt_rows, and returns the row count (or -1 on
+// error, with mysql_stmt_error(stmt) holding the message).
+static int fetch_mysql_stmt_results(db_t* db, MYSQL_STMT* stmt);
+
+#ifdef DEBUGMALLOC_EXTENSIONS
+static void mark_mysql_stmt() {
+  if (mysql_stmt_list) {
+    DO_MARK(mysql_stmt_list, TAG_DB);
+  }
+}
 #endif
+#endif  // USE_MYSQL
 
 #ifdef USE_POSTGRES
 static int Postgres_connect(dbconn_t*, const char*, const char*, const char*, const char*);
@@ -216,6 +321,14 @@ void f_db_close() {
 
   // Serialize against package/async's DB worker thread (see DbAsyncLock).
   DB_ASYNC_LOCK();
+
+#ifdef USE_MYSQL
+  // Must run before db->type->close() below invalidates the MYSQL* every
+  // open prepared statement on this connection points at.
+  if (db->type == &mysql) {
+    close_mysql_stmts_for_connection(sp->u.number);
+  }
+#endif
 
   /* Cleanup any memory structures left around */
   if (db->type->cleanup) {
@@ -504,6 +617,39 @@ void f_db_fetch() {
 }
 #endif
 
+/* int db_free_result(int handle);
+ *
+ * Explicitly releases the current (unread) result set for a connection
+ * handle, without waiting for the next db_exec()/db_stmt_exec() or
+ * db_close() to do it implicitly. Useful to proactively drop a large or
+ * no-longer-needed result set, and to recover from a "Commands out of
+ * sync" condition without closing the connection.
+ *
+ * Returns 1 on success, 0 if the database type has nothing to free.
+ */
+#ifdef F_DB_FREE_RESULT
+void f_db_free_result() {
+  int ret = 0;
+  db_t* db;
+
+  valid_database("free_result", &the_null_array);
+
+  db = find_db_conn(sp->u.number);
+  if (!db) {
+    error("Attempt to free the result of an invalid database handle\n");
+  }
+
+  DB_ASYNC_LOCK();  // serialize against the async DB worker thread
+
+  if (db->type->cleanup) {
+    db->type->cleanup(&(db->c));
+    ret = 1;
+  }
+
+  sp->u.number = ret;
+}
+#endif
+
 /* int db_rollback(int handle)
  *
  * Rollsback all db_exec() calls back to the last db_commit() call for the
@@ -570,11 +716,323 @@ void f_db_status() {
 }
 #endif
 
+/* int db_stmt_prepare(int handle, string sql);
+ *
+ * Prepares (but does not execute) the SQL statement for the given database
+ * connection, using placeholders ('?') for parameters to be bound later by
+ * db_stmt_exec(). Only supported for MySQL connections.
+ *
+ * Returns a statement handle on success, or an error string on failure.
+ */
+#ifdef F_DB_STMT_PREPARE
+void f_db_stmt_prepare() {
+#ifdef USE_MYSQL
+  array_t* info;
+
+  info = allocate_empty_array(1);
+  info->item[0].type = T_STRING;
+  info->item[0].subtype = STRING_MALLOC;
+  info->item[0].u.string = string_copy(sp->u.string, "f_db_stmt_prepare");
+  valid_database("stmt_prepare", info);
+
+  db_t* db = find_db_conn((sp - 1)->u.number);
+  if (!db) {
+    error("Attempt to prepare a statement on an invalid database handle\n");
+  }
+  if (db->type != &mysql) {
+    error("db_stmt_prepare: prepared statements are only supported for MySQL connections\n");
+  }
+
+  DB_ASYNC_LOCK();  // serialize against the async DB worker thread
+
+  MYSQL_STMT* stmt = mysql_stmt_init(db->c.mysql.handle);
+  if (!stmt) {
+    pop_n_elems(2);
+    push_malloced_string(string_copy("Could not allocate statement handle", "f_db_stmt_prepare"));
+    return;
+  }
+
+  if (mysql_stmt_prepare(stmt, sp->u.string, SVALUE_STRLEN(sp))) {
+    char* err = string_copy(mysql_stmt_error(stmt), "f_db_stmt_prepare");
+    mysql_stmt_close(stmt);
+    pop_n_elems(2);
+    push_malloced_string(err);
+    return;
+  }
+
+  int handle = create_mysql_stmt((sp - 1)->u.number, stmt);
+  pop_n_elems(2);
+  push_number(handle);
+#else
+  error("db_stmt_prepare: prepared statements require MySQL support\n");
+#endif
+}
+#endif
+
+/* mixed db_stmt_exec(int stmt_handle, mixed args...);
+ *
+ * Binds `args` (in order) to the '?' placeholders of a statement prepared
+ * with db_stmt_prepare(), then executes it. Each arg must be int, float,
+ * string, or buffer -- except an UNDEFINED value (undefinedp() == 1, e.g.
+ * an unassigned `mixed` local, or a missing mapping key), which binds a
+ * real SQL NULL (a plain `0` binds as the literal integer 0). The result
+ * set (if any) is cached on the statement's owning connection exactly like
+ * db_exec()'s, so it is retrieved the same way: db_fetch(db_handle, row).
+ *
+ * Returns the number of rows in the result set (or affected rows, for
+ * statements with no result set) on success, or an error string on failure.
+ */
+#ifdef F_DB_STMT_EXEC
+void f_db_stmt_exec() {
+#ifdef USE_MYSQL
+  int const num_arg = st_num_arg;
+  svalue_t* arg = sp - num_arg + 1;  // arg[0] = stmt handle, arg[1..] = bind params
+  int const nparams = num_arg - 1;
+
+  valid_database("stmt_exec", &the_null_array);
+
+  mysql_stmt_entry_t* se = find_mysql_stmt(arg[0].u.number);
+  if (!se) {
+    error("Attempt to execute an invalid prepared statement handle\n");
+  }
+  db_t* db = find_db_conn(se->db_handle);
+  if (!db) {
+    error("db_stmt_exec: the statement's database connection is no longer valid\n");
+  }
+
+  DB_ASYNC_LOCK();  // serialize against the async DB worker thread
+
+  // Drop any previous db_exec()/db_stmt_exec() result cache before reusing
+  // the connection, so a failed exec() here can't leave stale rows behind.
+  if (db->type->cleanup) {
+    db->type->cleanup(&(db->c));
+  }
+
+  MYSQL_STMT* stmt = se->stmt;
+
+  if ((unsigned long)nparams != mysql_stmt_param_count(stmt)) {
+    char error_message[128];
+    unsigned long const expected = mysql_stmt_param_count(stmt);
+    snprintf(error_message, sizeof(error_message),
+             "db_stmt_exec: parameter count mismatch (supplied %d, expected %lu)", nparams,
+             expected);
+    pop_n_elems(num_arg);
+    push_malloced_string(string_copy(error_message, "f_db_stmt_exec"));
+    return;
+  }
+
+  // RAII: every buffer below is reclaimed on the normal path AND on an
+  // error()/throw unwind (AGENTS.md section 4), since nothing here is a raw
+  // owning pointer outside these containers.
+  std::vector<MYSQL_BIND> param_binds(nparams > 0 ? nparams : 1);
+  memset(param_binds.data(), 0, sizeof(MYSQL_BIND) * param_binds.size());
+  std::vector<long long> int_storage(nparams > 0 ? nparams : 1, 0);
+  std::vector<double> real_storage(nparams > 0 ? nparams : 1, 0.0);
+
+  for (int i = 0; i < nparams; i++) {
+    svalue_t* a = &arg[1 + i];
+    // An UNINITIALIZED mixed variable (or a missing mapping key) is LPC's
+    // existing "undefined" value (undefinedp() == 1) -- repurposed here as
+    // the only way to bind an explicit SQL NULL, since a plain `0` binds as
+    // the literal integer 0 (common for numeric columns; auto-converting it
+    // to NULL would make it impossible to ever insert a real zero).
+    if (a->type == T_NUMBER && a->subtype == T_UNDEFINED) {
+      param_binds[i].buffer_type = MYSQL_TYPE_NULL;
+      continue;
+    }
+    switch (a->type) {
+      case T_NUMBER:
+        int_storage[i] = a->u.number;
+        param_binds[i].buffer_type = MYSQL_TYPE_LONGLONG;
+        param_binds[i].buffer = &int_storage[i];
+        break;
+      case T_REAL:
+        real_storage[i] = a->u.real;
+        param_binds[i].buffer_type = MYSQL_TYPE_DOUBLE;
+        param_binds[i].buffer = &real_storage[i];
+        break;
+      case T_STRING:
+        param_binds[i].buffer_type = MYSQL_TYPE_STRING;
+        param_binds[i].buffer = const_cast<char*>(a->u.string);
+        param_binds[i].buffer_length = SVALUE_STRLEN(a);
+        break;
+      case T_BUFFER:
+        param_binds[i].buffer_type = MYSQL_TYPE_BLOB;
+        param_binds[i].buffer = a->u.buf->item;
+        param_binds[i].buffer_length = a->u.buf->size;
+        break;
+      default:
+        error("db_stmt_exec: parameter %d must be int, float, string, or buffer\n", i + 1);
+    }
+  }
+
+  if (nparams > 0 && mysql_stmt_bind_param(stmt, param_binds.data())) {
+    char* err = string_copy(mysql_stmt_error(stmt), "f_db_stmt_exec");
+    pop_n_elems(num_arg);
+    push_malloced_string(err);
+    return;
+  }
+
+  if (mysql_stmt_execute(stmt)) {
+    char* err = string_copy(mysql_stmt_error(stmt), "f_db_stmt_exec");
+    pop_n_elems(num_arg);
+    push_malloced_string(err);
+    return;
+  }
+
+  int const ret = fetch_mysql_stmt_results(db, stmt);
+
+  pop_n_elems(num_arg);
+  if (ret < 0) {
+    push_malloced_string(string_copy(mysql_stmt_error(stmt), "f_db_stmt_exec"));
+  } else {
+    push_number(ret);
+  }
+#else
+  error("db_stmt_exec: prepared statements require MySQL support\n");
+#endif
+}
+#endif
+
+/* int db_stmt_close(int stmt_handle);
+ *
+ * Closes a prepared statement and releases its handle. Any cached result
+ * set on the owning connection is left untouched (use db_stmt_free_result()
+ * or db_free_result() for that).
+ *
+ * Returns 1 on success, 0 on failure.
+ */
+#ifdef F_DB_STMT_CLOSE
+void f_db_stmt_close() {
+  int ret = 0;
+
+  valid_database("stmt_close", &the_null_array);
+
+#ifdef USE_MYSQL
+  mysql_stmt_entry_t* se = find_mysql_stmt(sp->u.number);
+  if (!se) {
+    error("Attempt to close an invalid prepared statement handle\n");
+  }
+
+  DB_ASYNC_LOCK();  // serialize against the async DB worker thread
+
+  ret = close_mysql_stmt(se);
+#else
+  error("db_stmt_close: prepared statements require MySQL support\n");
+#endif
+
+  sp->u.number = ret;
+}
+#endif
+
+/* int db_stmt_free_result(int stmt_handle);
+ *
+ * Releases the result set cached by the last db_stmt_exec()/
+ * db_stmt_next_result() call on this statement, without closing it (the
+ * statement can still be re-executed with db_stmt_exec()).
+ *
+ * Returns 1 on success, 0 on failure.
+ */
+#ifdef F_DB_STMT_FREE_RESULT
+void f_db_stmt_free_result() {
+  int ret = 0;
+
+  valid_database("stmt_free_result", &the_null_array);
+
+#ifdef USE_MYSQL
+  mysql_stmt_entry_t* se = find_mysql_stmt(sp->u.number);
+  if (!se) {
+    error("Attempt to free the result of an invalid prepared statement handle\n");
+  }
+  db_t* db = find_db_conn(se->db_handle);
+
+  DB_ASYNC_LOCK();  // serialize against the async DB worker thread
+
+  if (db && db->type->cleanup) {
+    db->type->cleanup(&(db->c));
+  }
+  if (se->stmt) {
+    mysql_stmt_free_result(se->stmt);
+    ret = 1;
+  }
+#else
+  error("db_stmt_free_result: prepared statements require MySQL support\n");
+#endif
+
+  sp->u.number = ret;
+}
+#endif
+
+/* mixed db_stmt_next_result(int stmt_handle);
+ *
+ * Advances a prepared CALL to a stored procedure (or a multi-statement
+ * query) to its next pending result set, replacing the connection's cached
+ * result set (fetched the same way, via db_fetch()) with the new one.
+ *
+ * Returns the number of rows in the next result set, 0 if there are no more
+ * results, or an error string if MySQL reports an error.
+ */
+#ifdef F_DB_STMT_NEXT_RESULT
+void f_db_stmt_next_result() {
+  int ret = 0;
+
+  valid_database("stmt_next_result", &the_null_array);
+
+#ifdef USE_MYSQL
+  mysql_stmt_entry_t* se = find_mysql_stmt(sp->u.number);
+  if (!se) {
+    error("Attempt to advance an invalid prepared statement handle\n");
+  }
+  db_t* db = find_db_conn(se->db_handle);
+  if (!db) {
+    error("db_stmt_next_result: the statement's database connection is no longer valid\n");
+  }
+
+  DB_ASYNC_LOCK();  // serialize against the async DB worker thread
+
+  if (db->type->cleanup) {
+    db->type->cleanup(&(db->c));
+  }
+
+  int const status = mysql_stmt_next_result(se->stmt);
+  if (status < 0) {
+    sp->u.number = 0;
+    return;
+  }
+  if (status > 0) {
+    char* err = string_copy(mysql_stmt_error(se->stmt), "f_db_stmt_next_result");
+    pop_stack();
+    push_malloced_string(err);
+    return;
+  }
+
+  int const rows = fetch_mysql_stmt_results(db, se->stmt);
+  if (rows < 0) {
+    char* err = string_copy(mysql_stmt_error(se->stmt), "f_db_stmt_next_result");
+    pop_stack();
+    push_malloced_string(err);
+    return;
+  }
+  sp->u.number = rows;
+#else
+  error("db_stmt_next_result: prepared statements require MySQL support\n");
+#endif
+}
+#endif
+
 void db_cleanup() {
   int i;
 
   for (i = 0; i < db_conn_alloc; i++) {
     if (!(db_conn_list[i].flags & DB_FLAG_EMPTY)) {
+#ifdef USE_MYSQL
+      // Must run before type->close() below invalidates the MYSQL* every
+      // open prepared statement on this connection points at.
+      if (db_conn_list[i].type == &mysql) {
+        close_mysql_stmts_for_connection(i + 1);
+      }
+#endif
+
       if (db_conn_list[i].type->cleanup) {
         db_conn_list[i].type->cleanup(&(db_conn_list[i].c));
       }
@@ -646,7 +1104,28 @@ void mark_db_conn() {
   auto* node = db_conn_list;
   if (node) {
     DO_MARK(node, TAG_DB);
+#ifdef USE_MYSQL
+    // stmt_rows/stmt_fields are owned refs living off the normal LPC object
+    // graph (reachable only through this C struct) -- bump their extra_ref
+    // directly, like any other root reference (AGENTS.md section 3). Their
+    // CONTENTS get marked for free by checkmemory.cc's generic per-tag
+    // TAG_ARRAY sweep, since these are themselves ordinary array_t blocks.
+    for (int i = 0; i < db_conn_alloc; i++) {
+      if ((node[i].flags & DB_FLAG_EMPTY) || node[i].type != &mysql) {
+        continue;
+      }
+      if (node[i].c.mysql.stmt_fields) {
+        node[i].c.mysql.stmt_fields->extra_ref++;
+      }
+      if (node[i].c.mysql.stmt_rows) {
+        node[i].c.mysql.stmt_rows->extra_ref++;
+      }
+    }
+#endif
   }
+#ifdef USE_MYSQL
+  mark_mysql_stmt();
+#endif
 }
 #endif
 
@@ -659,6 +1138,14 @@ static void MySQL_cleanup(dbconn_t* c) {
   if (c->mysql.results) {
     mysql_free_result(c->mysql.results);
     c->mysql.results = nullptr;
+  }
+  if (c->mysql.stmt_rows) {
+    free_array(c->mysql.stmt_rows);
+    c->mysql.stmt_rows = nullptr;
+  }
+  if (c->mysql.stmt_fields) {
+    free_array(c->mysql.stmt_fields);
+    c->mysql.stmt_fields = nullptr;
   }
 }
 
@@ -698,6 +1185,26 @@ static array_t* MySQL_fetch(dbconn_t* c, int row) {
   array_t* v;
   MYSQL_ROW target_row;
   unsigned int i, num_fields;
+
+  // Rows materialized by db_stmt_exec()/db_stmt_next_result() -- served
+  // directly, no further MySQL C API calls needed. Each call hands out a
+  // new reference to the shared cached array, like returning a cached
+  // shared string or object reference (AGENTS.md section 3).
+  if (c->mysql.stmt_rows || c->mysql.stmt_fields) {
+    if (row == 0) {
+      if (!c->mysql.stmt_fields) {
+        return &the_null_array;
+      }
+      c->mysql.stmt_fields->ref++;
+      return c->mysql.stmt_fields;
+    }
+    if (!c->mysql.stmt_rows || row < 1 || row > c->mysql.stmt_rows->size) {
+      return &the_null_array;
+    }
+    array_t* cached = c->mysql.stmt_rows->item[row - 1].u.arr;
+    cached->ref++;
+    return cached;
+  }
 
   if (!c->mysql.results) {
     return &the_null_array;
@@ -812,6 +1319,201 @@ static array_t* MySQL_fetch(dbconn_t* c, int row) {
   return v;
 }
 
+// Binds result columns for the statement's CURRENT result set, fully
+// fetches it (mysql_stmt_store_result() buffers it client-side, exactly
+// like mysql_store_result() does for the text protocol -- this is what
+// keeps a half-read prepared statement from causing a later "Commands out
+// of sync" on this connection), and materializes every row into real LPC
+// arrays cached on db->c.mysql.stmt_fields/stmt_rows for MySQL_fetch() to
+// serve. Returns the row count (>= 0) on success, or -1 on a MySQL error
+// (mysql_stmt_error(stmt) has the message). A statement with no result set
+// (INSERT/UPDATE/DELETE) returns the affected-row count and leaves the
+// cache untouched (nullptr, i.e. "no rows" from db_fetch()).
+//
+// Column/row buffers are RAII (std::vector/unique_ptr) so an error()/throw
+// partway through (e.g. allocate_empty_array() hitting the array size cap)
+// leaks nothing (AGENTS.md section 4); the two `*_handed_off` flags guard
+// the only two raw-ownership-transfer points (an array_t* handed to
+// another array_t*, not reclaimable by its own destructor).
+static int fetch_mysql_stmt_results(db_t* db, MYSQL_STMT* stmt) {
+  dbconn_t* c = &db->c;
+
+  unsigned int const num_fields = mysql_stmt_field_count(stmt);
+  if (num_fields == 0) {
+    uint64_t const affected = mysql_stmt_affected_rows(stmt);
+    return affected > (uint64_t)INT_MAX ? INT_MAX : (int)affected;
+  }
+
+  MYSQL_RES* meta = mysql_stmt_result_metadata(stmt);
+  if (!meta) {
+    return -1;
+  }
+  DEFER { mysql_free_result(meta); };
+
+  if (mysql_stmt_store_result(stmt)) {
+    return -1;
+  }
+  DEFER { mysql_stmt_free_result(stmt); };
+
+  MYSQL_FIELD* fields = mysql_fetch_fields(meta);
+
+  std::vector<MYSQL_BIND> binds(num_fields);
+  memset(binds.data(), 0, sizeof(MYSQL_BIND) * num_fields);
+  std::vector<long long> int_storage(num_fields, 0);
+  std::vector<double> real_storage(num_fields, 0.0);
+  auto is_null = std::make_unique<bool[]>(num_fields);
+  auto trunc_err = std::make_unique<bool[]>(num_fields);
+  std::vector<unsigned long> lengths(num_fields, 0);
+
+  for (unsigned int i = 0; i < num_fields; i++) {
+    binds[i].is_null = &is_null[i];
+    binds[i].error = &trunc_err[i];
+    binds[i].length = &lengths[i];
+
+    switch (fields[i].type) {
+      case MYSQL_TYPE_TINY:
+      case MYSQL_TYPE_SHORT:
+      case MYSQL_TYPE_DECIMAL:
+      case MYSQL_TYPE_NEWDECIMAL:
+      case MYSQL_TYPE_LONG:
+      case MYSQL_TYPE_INT24:
+      case MYSQL_TYPE_LONGLONG:
+        binds[i].buffer_type = MYSQL_TYPE_LONGLONG;
+        binds[i].buffer = &int_storage[i];
+        binds[i].buffer_length = sizeof(long long);
+        break;
+
+      case MYSQL_TYPE_FLOAT:
+      case MYSQL_TYPE_DOUBLE:
+        binds[i].buffer_type = MYSQL_TYPE_DOUBLE;
+        binds[i].buffer = &real_storage[i];
+        binds[i].buffer_length = sizeof(double);
+        break;
+
+      default:
+        // Strings, blobs, and date/time columns: fetched as text/bytes.
+        // buffer_length 0 forces MYSQL_DATA_TRUNCATED on every non-NULL
+        // value, so bind[i].length always holds the row's REAL length (not
+        // field->max_length, the column-wide max -- see MySQL_fetch's BLOB
+        // comment above) and we fetch the full value with
+        // mysql_stmt_fetch_column() below.
+        binds[i].buffer_type =
+            (fields[i].flags & BINARY_FLAG) ? MYSQL_TYPE_BLOB : MYSQL_TYPE_STRING;
+        binds[i].buffer = nullptr;
+        binds[i].buffer_length = 0;
+        break;
+    }
+  }
+
+  if (mysql_stmt_bind_result(stmt, binds.data())) {
+    return -1;
+  }
+
+  std::vector<array_t*> row_arrays;
+  row_arrays.reserve((size_t)mysql_stmt_num_rows(stmt));
+  bool rows_handed_off = false;
+  DEFER {
+    if (!rows_handed_off) {
+      for (array_t* r : row_arrays) free_array(r);
+    }
+  };
+
+  for (;;) {
+    int const fetch_ret = mysql_stmt_fetch(stmt);
+    if (fetch_ret == MYSQL_NO_DATA) {
+      break;
+    }
+    if (fetch_ret != 0 && fetch_ret != MYSQL_DATA_TRUNCATED) {
+      return -1;
+    }
+
+    array_t* row = allocate_empty_array(num_fields);
+    row_arrays.push_back(row);
+
+    for (unsigned int i = 0; i < num_fields; i++) {
+      if (is_null[i]) {
+        row->item[i] = const0u;
+        continue;
+      }
+
+      switch (binds[i].buffer_type) {
+        case MYSQL_TYPE_LONGLONG:
+          row->item[i].type = T_NUMBER;
+          row->item[i].u.number = int_storage[i];
+          break;
+
+        case MYSQL_TYPE_DOUBLE:
+          row->item[i].type = T_REAL;
+          row->item[i].u.real = real_storage[i];
+          break;
+
+        default: {
+          unsigned long const len = lengths[i];
+          std::vector<char> col_buf(len ? len : 1);
+          if (len) {
+            MYSQL_BIND fb;
+            memset(&fb, 0, sizeof(fb));
+            fb.buffer_type = binds[i].buffer_type;
+            fb.buffer = col_buf.data();
+            fb.buffer_length = len;
+            if (mysql_stmt_fetch_column(stmt, &fb, i, 0)) {
+              return -1;
+            }
+          }
+
+          if (binds[i].buffer_type == MYSQL_TYPE_BLOB) {
+            row->item[i].type = T_BUFFER;
+            row->item[i].u.buf = allocate_buffer(len);
+            if (len) {
+              write_buffer(row->item[i].u.buf, 0, col_buf.data(), len);
+            }
+          } else {
+            row->item[i].type = T_STRING;
+            if (len) {
+              row->item[i].subtype = STRING_MALLOC;
+              char* s = new_string(len, "fetch_mysql_stmt_results");
+              memcpy(s, col_buf.data(), len);
+              s[len] = 0;
+              row->item[i].u.string = s;
+            } else {
+              row->item[i].subtype = STRING_CONSTANT;
+              row->item[i].u.string = (char*)"";
+            }
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // field_row is built (and separately guarded) before `rows` so that if
+  // allocating `rows` throws, row_arrays is still freed by the DEFER above
+  // and field_row by its own guard below.
+  array_t* field_row = allocate_empty_array(num_fields);
+  bool field_row_handed_off = false;
+  DEFER {
+    if (!field_row_handed_off) free_array(field_row);
+  };
+  for (unsigned int i = 0; i < num_fields; i++) {
+    field_row->item[i].type = T_STRING;
+    field_row->item[i].subtype = STRING_MALLOC;
+    field_row->item[i].u.string = string_copy(fields[i].name, "fetch_mysql_stmt_results");
+  }
+
+  array_t* rows = allocate_empty_array((int)row_arrays.size());
+  for (size_t i = 0; i < row_arrays.size(); i++) {
+    rows->item[i].type = T_ARRAY;
+    rows->item[i].u.arr = row_arrays[i];
+  }
+  rows_handed_off = true;
+  field_row_handed_off = true;
+
+  c->mysql.stmt_fields = field_row;
+  c->mysql.stmt_rows = rows;
+
+  return (int)row_arrays.size();
+}
+
 static int MySQL_connect(dbconn_t* c, const char* host, const char* database, const char* username,
                          const char* password) {
   int ret;
@@ -845,6 +1547,12 @@ static int MySQL_connect(dbconn_t* c, const char* host, const char* database, co
   }
 
   c->mysql.results = nullptr;
+  // db_t slots are reused across connections (create_db_conn() recycles
+  // freed slots without clearing the union) -- without this, a fresh
+  // connection could inherit a stale stmt_rows/stmt_fields pointer from
+  // whatever previously occupied this slot.
+  c->mysql.stmt_rows = nullptr;
+  c->mysql.stmt_fields = nullptr;
   return 1;
 }
 #endif

@@ -27,6 +27,13 @@ union dbconn_t {
     char errormsg[256];
     MYSQL* handle;
     MYSQL_RES* results;
+    // Populated by db_stmt_exec()/db_stmt_next_result() (db.cc's
+    // fetch_mysql_stmt_results()); consumed by MySQL_fetch() exactly like
+    // `results` above, so db_fetch() needs no changes to serve prepared-
+    // statement rows. Both own one ref on the cached array_t*; freed (and
+    // nulled) by MySQL_cleanup().
+    array_t* stmt_fields;
+    array_t* stmt_rows;
   } mysql;
 #endif
 #ifdef USE_SQLITE3
