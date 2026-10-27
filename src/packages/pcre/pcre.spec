@@ -10,3 +10,4 @@ string *pcre_extract(string, string, void | int | mapping, void | int | mapping)
 string pcre_replace(string, string, string * | string, void | int | mapping);
 string pcre_replace_callback(string, string, string | function, ..., void | int | mapping);
 mapping pcre_cache(void);
+string *pcre_split(string, string, int);

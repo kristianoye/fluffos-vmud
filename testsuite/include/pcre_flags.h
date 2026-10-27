@@ -4,6 +4,8 @@
 
 #define PCRE_DEFAULT 0
 
+#define PCRE_SPLIT_DELIM_CAPTURE (1 << 15)
+
 #define PCRE_I (1 << 16)  // PCRE2_CASELESS
 #define PCRE_M (1 << 17)  // PCRE2_MULTILINE
 #define PCRE_S (1 << 18)  // PCRE2_DOTALL

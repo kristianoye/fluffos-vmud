@@ -2534,6 +2534,12 @@
           },
           {
             "type": "doc",
+            "id": "efun/pcre/pcre_split",
+            "key": "efun/pcre/pcre_split",
+            "label": "pcre_split"
+          },
+          {
+            "type": "doc",
             "id": "efun/pcre/pcre_version",
             "key": "efun/pcre/pcre_version",
             "label": "pcre_version"
