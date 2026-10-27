@@ -66,11 +66,12 @@
 // TODO
 // store reg->error & reg->erroffset before error(..)
 
+#include "base/package_api.h"
+
 #include <cstring>
 #include <memory>
 #include <utility>
 #include <thirdparty/scope_guard/scope_guard.hpp>
-#include "base/package_api.h"
 
 #include "pcre.h"
 #include "include/pcre_flags.h"
@@ -654,6 +655,99 @@ void f_pcre_cache() {
   } else {
     push_refed_mapping(m);
   }
+}
+
+void f_pcre_split() {
+  const auto* arg = sp - 2;
+  const LPC_INT flags = sp->u.number;
+  pcre_options opts = default_pcre_options();
+  apply_int_flags(&opts, flags);
+
+  auto* run = static_cast<pcre_t*>(DCALLOC(1, sizeof(pcre_t), TAG_TEMPORARY, "pcre_split"));
+  DEFER { pcre_free_memory(run); };
+  run->pattern = (arg + 1)->u.string;
+  run->subject = arg->u.string;
+  run->s_length = SVALUE_STRLEN(arg);
+  assign_run_options(run, opts);
+  if (pcre_ensure_compiled(run) < 0) {
+    error("PCRE compilation failed at offset %d: %s\n", run->erroffset, run->error);
+  }
+
+  uint32_t newline = 0;
+  pcre2_pattern_info(run->re, PCRE2_INFO_NEWLINE, &newline);
+  const bool crlf = newline == PCRE2_NEWLINE_CRLF || newline == PCRE2_NEWLINE_ANY ||
+                    newline == PCRE2_NEWLINE_ANYCRLF;
+  const auto max_size = static_cast<size_t>(CONFIG_INT(__MAX_ARRAY_SIZE__));
+  std::vector<std::pair<size_t, size_t>> parts;
+  auto append = [&](size_t start, size_t end) {
+    if (parts.size() >= max_size) {
+      error("Too many elements for pcre_split().\n");
+    }
+    parts.emplace_back(start, end);
+  };
+
+  size_t offset = 0;
+  size_t last_end = 0;
+  int retry_flags = 0;
+  while (offset <= run->s_length) {
+    const int rc = pcre_exec_at(run, offset, retry_flags);
+    pcre_throw_if_limit_error(rc);
+    if (rc == PCRE2_ERROR_NOMATCH) {
+      if (!retry_flags || offset == run->s_length) {
+        break;
+      }
+      // Retry a non-empty alternative first; only then advance past the empty match.
+      if (crlf && run->subject[offset] == '\r' && offset + 1 < run->s_length &&
+          run->subject[offset + 1] == '\n') {
+        offset += 2;
+      } else {
+        offset++;
+        while (offset < run->s_length && (run->subject[offset] & 0xC0) == 0x80) {
+          offset++;
+        }
+      }
+      retry_flags = 0;
+      continue;
+    }
+    if (rc < 0) {
+      char message[256];
+      pcre2_get_error_message(rc, reinterpret_cast<PCRE2_UCHAR*>(message), sizeof(message));
+      error("PCRE split failed: %s\n", message);
+    }
+
+    const auto start = static_cast<size_t>(run->ovector[0]);
+    const auto end = static_cast<size_t>(run->ovector[1]);
+    if (start < last_end || end < start || end > run->s_length) {
+      error("PCRE split failed: invalid delimiter offsets.\n");
+    }
+    append(last_end, start);
+    if (flags & PCRE_SPLIT_DELIM_CAPTURE) {
+      for (int i = 1; i < run->ovecsize / 2; i++) {
+        if (i >= rc || run->ovector[2 * i] < 0) {
+          append(0, 0);
+        } else {
+          append(run->ovector[2 * i], run->ovector[2 * i + 1]);
+        }
+      }
+    }
+    last_end = end;
+    offset = end;
+    retry_flags = start == end ? PCRE2_NOTEMPTY_ATSTART | PCRE2_ANCHORED : 0;
+  }
+  append(last_end, run->s_length);
+
+  std::unique_ptr<array_t, decltype(&free_array)> result(allocate_array(parts.size()), &free_array);
+  for (size_t i = 0; i < parts.size(); i++) {
+    const auto [start, end] = parts[i];
+    char* text = new_string(end - start, "pcre_split");
+    memcpy(text, run->subject + start, end - start);
+    text[end - start] = '\0';
+    result->item[i].type = T_STRING;
+    result->item[i].subtype = STRING_MALLOC;
+    result->item[i].u.string = text;
+  }
+  pop_3_elems();
+  push_refed_array(result.release());
 }
 
 // Internal functions utilized by the efuns

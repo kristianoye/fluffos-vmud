@@ -1,0 +1,45 @@
+#ifdef __PACKAGE_PCRE__
+#include <pcre_flags.h>
+
+void do_tests() {
+  int capture = PCRE_SPLIT_DELIM_CAPTURE;
+
+  ASSERT_EQ(({ "one", "two", "three" }), pcre_split("one, two;three", "[,;]\\s*", 0));
+  ASSERT_EQ(({ "abc" }), pcre_split("abc", ",", 0));
+  ASSERT_EQ(({ "" }), pcre_split("", ",", 0));
+  ASSERT_EQ(({ "", "a", "", "b", "" }), pcre_split(",a,,b,", ",", 0));
+  ASSERT_EQ(({ "", "" }), pcre_split("", "", 0));
+  ASSERT_EQ(({ "", "a", "b", "" }), pcre_split("ab", "", 0));
+  ASSERT_EQ(({ "a", "b" }), pcre_split("aXb", "x", PCRE_I));
+  ASSERT_EQ(({ "aXb" }), pcre_split("aXb", "x", 0));
+  ASSERT_EQ(({ "a\n", "b" }), pcre_split("a\n#b", "^#", PCRE_M));
+  ASSERT_EQ(({ "a", "b" }), pcre_split("aX\nYb", "X.Y", PCRE_S));
+  ASSERT_EQ(({ "a", "b" }), pcre_split("a,b", ",|$", PCRE_NOTEMPTY));
+  ASSERT_EQ(({ "a", "b" }), pcre_split("a,b", " , ", PCRE_X));
+  ASSERT_EQ(({ "a", "" }), pcre_split("a12b34b", "1.*b", 0));
+  ASSERT_EQ(({ "a", "34b" }), pcre_split("a12b34b", "1.*b", PCRE_U));
+  ASSERT_EQ(({ "a,b" }), pcre_split("a,b", ",", PCRE_A));
+  ASSERT_EQ(({ "a", "b" }), pcre_split("a,b", "(,)", 0));
+  ASSERT_EQ(({ "a", ",", "b" }), pcre_split("a,b", "(,)", capture));
+  ASSERT_EQ(({ "a", "X", "b" }), pcre_split("aXb", "(x)", capture | PCRE_I));
+  ASSERT_EQ(({ "a", ",", "", "b", "", ";", "c" }),
+    pcre_split("a,b;c", "(,)|(;)", capture));
+  ASSERT_EQ(({ "a", ",", ",", "b" }), pcre_split("a,b", "((,))", capture));
+  ASSERT_EQ(({ "a", "b" }), pcre_split("a,b", "(,)", capture | PCRE_NO_AUTO_CAPTURE));
+  ASSERT_EQ(({ "a", "b" }), pcre_split("ab", "(?=b)", 0));
+  ASSERT_EQ(({ "ab", "" }), pcre_split("ab", "$", 0));
+  ASSERT_EQ(({ "", "", "", "b", "" }), pcre_split("ab", "|a", 0));
+  ASSERT_EQ(({ "", "", "a", "", "b", "", "" }), pcre_split("ab", "()", capture));
+  ASSERT_EQ(({ "", "你", "好", "" }), pcre_split("你好", "", 0));
+  ASSERT_EQ(({ "你", "好" }), pcre_split("你，好", "，", 0));
+  ASSERT_EQ(({ "", "\r\n", "" }), pcre_split("\r\n", "(*CRLF)", 0));
+  ASSERT(catch(pcre_split("abc", "[", 0)));
+  ASSERT(catch(pcre_split("ab", "abcd", PCRE_PARTIAL)));
+  ASSERT(catch(pcre_split("b" + repeat_string("a", 30) + "!",
+    "(*LIMIT_MATCH=4)(*NO_JIT)b|(a+)+$", 0)));
+  ASSERT_EQ(100000, sizeof(pcre_split(repeat_string(",", 99999), ",", 0)));
+  ASSERT(catch(pcre_split(repeat_string(",", 100000), ",", 0)));
+  ASSERT(catch(pcre_split(repeat_string(",", 50000), "(,)", capture)));
+  ASSERT_EQ(({ "still", "works" }), pcre_split("still,works", ",", 0));
+}
+#endif

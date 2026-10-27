@@ -1,14 +1,18 @@
 // PCRE efun flags (kept in high bits to avoid legacy flag collisions).
 // Shared with mudlibs: copy this header into the mudlib include dir.
 //
-// Integer bits are the compatibility surface. Every pcre_* efun also accepts
-// a mapping of named PCRE2 options in the same argument slot — that is how
+// Integer bits are the compatibility surface. Except for pcre_split, pcre_*
+// efuns also accept a mapping of named PCRE2 options in the same argument slot.
+// That is how
 // options that do not fit in a 32-bit LPC int (and substitute / match-limit
 // controls) are exposed. See docs/efun/pcre/pcre_config.md.
 #ifndef SRC_INCLUDE_PCRE_FLAGS_H_
 #define SRC_INCLUDE_PCRE_FLAGS_H_
 
 #define PCRE_DEFAULT 0
+
+// Split-only: include parenthesized delimiter captures between fields.
+#define PCRE_SPLIT_DELIM_CAPTURE (1 << 15)
 
 // Compile-time options (same bits as the PCRE1-era flags)
 #define PCRE_I (1 << 16)  // PCRE2_CASELESS
